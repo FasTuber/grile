@@ -201,7 +201,7 @@ function renderHome() {
     ② <b>Inițiale</b>: punct + prima literă a fiecărui cuvânt din enunț — „Care dintre următoarele expresii logice…" → «<b>.cduel</b>»<br>
     ③ <b>Cod numeric</b>: aceleași inițiale, scrise ca cifre pe tastatura de telefon (2=ABC 3=DEF 4=GHI 5=JKL 6=MNO 7=PQRS 8=TUV 9=WXYZ) — c→2, d→3, u→8, e→3, l→5 = «<b>23835</b>» (minim 4 cifre)<br>
     ④ <b>Cod grilă</b>: «py 23» = Python, grila 23 din PDF (sau doar «23» într-o categorie)<br>
-    ⑤ <b>📷 Poză</b> — fotografiezi întrebarea și îți arăt potrivirile.<br>
+    ⑤ <b>📷 Poză</b> — fotografiezi o întrebare sau o pagină întreagă; identific toate grilele de pe ea.<br>
     Pe iPhone merge și microfonul de pe tastatură sau Scanare text (apasă lung în casetă).</div>`;
   CATS.forEach((cat, i) => {
     const n = DATA.filter(q => q.cat === cat).length;
@@ -356,8 +356,33 @@ async function fileToCanvas(file, maxDim) {
   const sc = Math.min(1, maxDim / Math.max(img.width, img.height));
   const c = document.createElement("canvas");
   c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
-  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  const ctx = c.getContext("2d");
+  ctx.drawImage(img, 0, 0, c.width, c.height);
   URL.revokeObjectURL(url);
+  // preprocesare pentru OCR: tonuri de gri + întindere de contrast (poze cu umbre/lumină slabă)
+  try {
+    const im = ctx.getImageData(0, 0, c.width, c.height);
+    const d = im.data;
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < d.length; i += 4) {
+      const g = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8;
+      d[i] = d[i + 1] = d[i + 2] = g;
+      hist[g]++;
+    }
+    const total = d.length / 4;
+    let lo = 0, hi = 255, acc = 0;
+    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > total * 0.02) { lo = v; break; } }
+    acc = 0;
+    for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc > total * 0.02) { hi = v; break; } }
+    if (hi > lo + 20) {
+      const k = 255 / (hi - lo);
+      for (let i = 0; i < d.length; i += 4) {
+        const g = Math.max(0, Math.min(255, (d[i] - lo) * k));
+        d[i] = d[i + 1] = d[i + 2] = g;
+      }
+    }
+    ctx.putImageData(im, 0, 0);
+  } catch (e) {}
   return c;
 }
 
@@ -377,7 +402,7 @@ async function handlePhoto(file) {
       });
     }
     count.innerHTML = "📷 Citesc poza… 0%";
-    const canvas = await fileToCanvas(file, 1800);
+    const canvas = await fileToCanvas(file, 2000);
     const { data } = await ocrWorker.recognize(canvas);
     photoSearch(data.text || "");
   } catch (e) {
@@ -385,37 +410,30 @@ async function handlePhoto(file) {
   }
 }
 
-function photoSearch(text) {
-  if (!DF) buildDF();
-  const toks = [...new Set(norm(text).split(/[^a-z0-9]+/).filter(t => t.length >= 3))].slice(0, 60);
-  if (toks.length < 2) {
-    count.innerHTML = "<em>⚠️ Nu am putut distinge text în poză. Încearcă o poză mai clară, decupată pe întrebare.</em>";
-    return;
-  }
+function tokensOf(text) {
+  return [...new Set(norm(text).split(/[^a-z0-9]+/).filter(t => t.length >= 3))].slice(0, 60);
+}
+function weighTokens(toks) {
   const N = DATA.length;
-  const weights = toks.map(t => {
+  return toks.map(t => {
     const df = DF.get(t) || 0;
     if (df > 0) return df > N * 0.3 ? 0 : Math.log(N / (1 + df));
-    return t.length >= 5 ? Math.log(N / 5) : 0; // posibil cuvânt citit greșit — îl păstrăm pentru potrivire aproximativă
+    return t.length >= 5 ? Math.log(N / 5) : 0; // posibil cuvânt citit greșit — păstrat pentru potrivire aproximativă
   });
+}
+// clasament: potrivire exactă pe tot pool-ul, apoi rafinare cu toleranță OCR pe primele 30
+function rankPool(pool, toks, weights) {
   const totalW = weights.reduce((a, b) => a + b, 0);
-  if (!totalW) {
-    count.innerHTML = "<em>⚠️ Textul din poză nu seamănă cu nicio grilă.</em>";
-    return;
-  }
-  const pool = getPool();
-  // pasul 1: potrivire exactă pe cuvinte
-  const prelim = [];
-  for (const item of pool) {
+  if (!totalW) return [];
+  const prelim = pool.map(item => {
     let s = 0;
     for (let k = 0; k < toks.length; k++) {
       if (weights[k] && item._atokset.has(toks[k])) s += weights[k];
     }
-    prelim.push([s, item]);
-  }
+    return [s, item];
+  });
   prelim.sort((a, b) => b[0] - a[0]);
-  // pasul 2: rafinare cu toleranță la erori OCR, doar pe primele 30
-  const top = prelim.slice(0, 30).map(([s0, item]) => {
+  const top = prelim.slice(0, 30).map(([, item]) => {
     let s = 0;
     for (let k = 0; k < toks.length; k++) {
       const t = toks[k], w = weights[k];
@@ -428,11 +446,66 @@ function photoSearch(text) {
     return [s / totalW, item];
   });
   top.sort((a, b) => b[0] - a[0]);
-  const results = top.filter(([r]) => r >= 0.18).slice(0, 10);
+  return top;
+}
+
+function photoSearch(text) {
+  if (!DF) buildDF();
+  const pool = getPool();
+
+  // segmentare: în PDF fiecare grilă începe cu numărul ei („12." sau „12)") la început de rând
+  const blocks = [];
+  let curB = null;
+  for (const raw of text.split(/\n/)) {
+    const ln = raw.trim();
+    if (!ln) continue;
+    const m = ln.match(/^(\d{1,3})\s*[.,)]\s+(.*)/);
+    if (m && +m[1] >= 1 && +m[1] <= 99) { curB = { nr: +m[1], text: m[2] }; blocks.push(curB); continue; }
+    if (curB) curB.text += " " + ln;
+  }
+  const qBlocks = blocks.filter(b => tokensOf(b.text).length >= 3).slice(0, 15);
+
+  if (qBlocks.length >= 2) {
+    // pagină cu mai multe grile: potrivește fiecare bloc separat
+    const found = [], scores = new Map(), qparts = [];
+    for (const b of qBlocks) {
+      const toks = tokensOf(b.text);
+      const ranked = rankPool(pool, toks, weighTokens(toks));
+      if (!ranked.length) continue;
+      // bonus dacă numărul citit de pe pagină coincide cu numărul oficial al grilei
+      const adj = ranked.slice(0, 5).map(([r, item]) => [r + (item.nr === b.nr ? 0.12 : 0), item]);
+      adj.sort((x, y) => y[0] - x[0]);
+      const [r, item] = adj[0];
+      if (r >= 0.22 && !scores.has(item)) {
+        found.push(item);
+        scores.set(item, Math.min(99, Math.round(Math.min(r, 1) * 100)));
+        for (const t of toks) if (DF.get(t)) qparts.push(t);
+      }
+    }
+    if (found.length) {
+      photoMode = {
+        results: found, scores,
+        qstr: [...new Set(qparts)].slice(0, 40).join(" "),
+        pageInfo: { detected: qBlocks.length, found: found.length }
+      };
+      shown = 40;
+      renderList();
+      return;
+    }
+  }
+
+  // o singură întrebare (sau segmentarea nu a găsit numere): potrivește tot textul
+  const toks = tokensOf(text);
+  if (toks.length < 2) {
+    count.innerHTML = "<em>⚠️ Nu am putut distinge text în poză. Încearcă o poză mai clară, decupată pe întrebare.</em>";
+    return;
+  }
+  const results = rankPool(pool, toks, weighTokens(toks)).filter(([r]) => r >= 0.18).slice(0, 10);
   if (!results.length) {
     count.innerHTML = "<em>⚠️ Nicio grilă suficient de asemănătoare. Încearcă o poză mai clară sau caută manual câteva cuvinte.</em>";
     return;
   }
+  const weights = weighTokens(toks);
   const matchedToks = toks.filter((t, k) => weights[k] && DF.get(t));
   photoMode = {
     results: results.map(([, item]) => item),
@@ -494,7 +567,9 @@ function renderList() {
   const matches = getMatches();
   const q = photoMode ? photoMode.qstr : search.value;
   if (photoMode) {
-    count.innerHTML = "📷 " + matches.length + (matches.length === 1 ? " potrivire probabilă" : " potriviri probabile")
+    count.innerHTML = "📷 " + (photoMode.pageInfo
+        ? photoMode.pageInfo.found + " grile identificate din " + photoMode.pageInfo.detected + " detectate pe pagină"
+        : matches.length + (matches.length === 1 ? " potrivire probabilă" : " potriviri probabile"))
       + " — <span class='clearphoto' id='clearphoto'>renunță ✕</span>";
   } else {
     count.innerHTML = matches.length
