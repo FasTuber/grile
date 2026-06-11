@@ -1,4 +1,4 @@
-const CACHE = "grile-v1";
+const CACHE = "grile-v3";
 const CORE = ["./", "./index.html", "./manifest.webmanifest", "./icon-180.png"];
 
 self.addEventListener("install", e => {
